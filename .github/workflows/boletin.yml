@@ -1,0 +1,42 @@
+name: Boletin ANMAT (nuevos registros)
+
+on:
+  schedule:
+    - cron: "0 */8 * * *"   # 3 veces por dia (horario UTC)
+  workflow_dispatch:          # boton para ejecutarlo a mano
+
+permissions:
+  contents: write
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Revisar el Boletin y avisar por Telegram
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python boletin.py
+
+      - name: Guardar los registros ya avisados
+        run: |
+          if [ -n "$(git status --porcelain vistos_boletin.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add vistos_boletin.json
+            git commit -m "Actualizar registros del Boletin vistos"
+            git push
+          else
+            echo "Sin cambios en vistos_boletin.json"
+          fi
