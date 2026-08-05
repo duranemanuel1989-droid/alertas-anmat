@@ -1,0 +1,42 @@
+name: Avisos ANMAT (diario)
+
+on:
+  schedule:
+    - cron: "0 21 * * *"   # 18:00 hora Argentina (UTC-3)
+  workflow_dispatch:          # boton para ejecutarlo a mano
+
+permissions:
+  contents: write
+
+jobs:
+  avisar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Revisar ANMAT (alertas + Boletin) y avisar por Telegram
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python avisos.py
+
+      - name: Guardar el estado (lo ya avisado)
+        run: |
+          if [ -n "$(git status --porcelain vistos.json vistos_boletin.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add vistos.json vistos_boletin.json
+            git commit -m "Actualizar estado de avisos"
+            git push
+          else
+            echo "Sin cambios en el estado"
+          fi
