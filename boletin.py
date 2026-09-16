@@ -13,7 +13,7 @@ Cuando hay novedades, en vez de mandar fotos manda UN archivo Excel (.xlsx)
 con UNA hoja que junta las dos solapas, con una columna "Tipo"
 (Registro / Notificación) y ordenada por Razon Social (para ver juntas todas
 las filas de una misma empresa). Cada fila trae: Tipo, Tramite, Fecha, Razon
-Social, Nombre, Marca, Modelo/s (texto completo), PM y Expediente.
+Social, Nombre, Marca, Modelo/s (resumido a ~4 lineas), PM y Expediente.
 
 Solo avisa lo nuevo; el estado ya avisado se guarda en 'vistos_boletin.json'.
 
@@ -183,12 +183,25 @@ _HEADERS = [
 # Etiqueta legible de la columna Tipo segun la solapa de origen.
 _TIPO = {"Registros": "Registro", "Notificaciones": "Notificación"}
 
-# La columna Modelo/s puede tener 30+ items y hacer filas gigantes. Limitamos
-# la ALTURA visible a ~4 lineas; el texto completo queda en la celda (se ve
-# expandiendo la fila) y el detalle fino esta siempre en el Boletin de ANMAT.
-LINEAS_MODELO = 4
-_ALTO_LINEA = 15          # alto aprox. de una linea (Calibri 11), en puntos
-_ALTO_FILA = LINEAS_MODELO * _ALTO_LINEA
+# La columna Modelo/s puede tener 30+ items y hacer filas gigantes. RECORTAMOS
+# el texto a ~4 lineas (por caracteres) y agregamos " […]" cuando se corta.
+# El detalle completo esta siempre en el Boletin de ANMAT (con PM/Expediente).
+# (Antes se probo limitar solo la ALTURA de la fila, pero Excel auto-expande las
+#  celdas con ajuste de texto al abrir, asi que el recorte del texto es lo unico
+#  que garantiza el resumen.)
+MODELO_MAX_CHARS = 220    # ~4 lineas con la columna Modelo/s en ancho 60
+
+
+def _recortar_modelo(txt, limite=MODELO_MAX_CHARS):
+    """Recorta Modelo/s a ~4 lineas, cortando en un espacio y agregando ' […]'."""
+    txt = " ".join((txt or "").split())  # colapsa espacios/saltos
+    if len(txt) <= limite:
+        return txt
+    corte = txt[:limite]
+    esp = corte.rfind(" ")
+    if esp > limite * 0.6:
+        corte = corte[:esp]
+    return corte.rstrip(" ,;.") + " […]"
 
 
 def _orden(it):
@@ -228,18 +241,19 @@ def construir_excel(nuevos_reg, nuevos_notif, path):
         ws.column_dimensions[get_column_letter(ci)].width = ancho
 
     for it in filas:
-        ws.append([it.get(k, "") for (k, _t, _w) in _HEADERS])
+        fila = []
+        for (k, _t, _w) in _HEADERS:
+            v = it.get(k, "")
+            if k == "modelo":
+                v = _recortar_modelo(v)   # ~4 lineas, con " […]" si se corta
+            fila.append(v)
+        ws.append(fila)
 
     # Ajuste de texto en Modelo/s (por nombre de encabezado, robusto al orden).
     col_modelo = [h[0] for h in _HEADERS].index("modelo") + 1
     for row in ws.iter_rows(min_row=2, min_col=col_modelo, max_col=col_modelo):
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-
-    # Altura fija de las filas de datos: muestra ~4 lineas de Modelo/s y oculta
-    # el resto (la fila se puede expandir a mano para ver todo el texto).
-    for r in range(2, ws.max_row + 1):
-        ws.row_dimensions[r].height = _ALTO_FILA
 
     ws.freeze_panes = "A2"
     ultima_col = get_column_letter(len(_HEADERS))
