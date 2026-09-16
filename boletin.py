@@ -2,17 +2,20 @@
 """
 Bot del Boletin de ANMAT (Helena - Productos Medicos) -> Telegram.
 
-Lee el listado de tramites/registros de productos medicos en
-https://helena.anmat.gob.ar/Boletin/ y avisa por Telegram (como foto tipo
-grilla) cuando aparecen registros nuevos.
+Lee el listado de productos medicos en https://helena.anmat.gob.ar/Boletin/
+y avisa por Telegram cuando aparecen novedades. Ahora revisa LAS DOS solapas
+de la pagina:
 
-De cada registro muestra: Nombre, Empresa (Razon Social), Marca, Tramite,
-PM y Modelo/s (resumido a las primeras palabras). El numero de Expediente se
-usa solo por dentro para no repetir avisos; no se muestra.
+  - "Registros"      (tabla gvTramites)
+  - "Notificaciones" (tabla gvDeclaraciones)  -> declaraciones juradas PM I-II
 
-Si hay muchos registros nuevos, se parte en varias fotos (12 por imagen).
+Cuando hay novedades, en vez de mandar fotos manda UN archivo Excel (.xlsx)
+con UNA hoja que junta las dos solapas, con una columna "Tipo"
+(Registro / Notificación) y ordenada por Razon Social (para ver juntas todas
+las filas de una misma empresa). Cada fila trae: Tipo, Tramite, Fecha, Razon
+Social, Nombre, Marca, Modelo/s (texto completo), PM y Expediente.
 
-Los registros ya avisados se guardan en 'vistos_boletin.json'.
+Solo avisa lo nuevo; el estado ya avisado se guarda en 'vistos_boletin.json'.
 
 Usa los mismos Secrets que el bot de alertas:
   - TELEGRAM_TOKEN
@@ -22,68 +25,125 @@ Usa los mismos Secrets que el bot de alertas:
 import os
 import sys
 import json
+from datetime import datetime
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
-import tabla_img
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+except Exception:
+    TZ = None
 
 URL = "https://helena.anmat.gob.ar/Boletin/"
-TABLE_ID = "ctl00_ContentPlaceHolder1_gvTramites"
+# Las dos solapas de la pagina ya vienen ambas en el HTML inicial (son pestañas
+# tipo Bootstrap: #tabRegistros y #tabDeclaraciones), no hace falta postback.
+TABLA_REGISTROS = "ctl00_ContentPlaceHolder1_gvTramites"
+TABLA_NOTIFICACIONES = "ctl00_ContentPlaceHolder1_gvDeclaraciones"
+
 STATE_FILE = Path("vistos_boletin.json")
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Caracteres del campo Modelo/s que se muestran en la grilla (el resto se corta).
-MODELO_LIMITE = 70
-# Cuantos registros entran por foto (para que cada imagen se lea bien).
-FILAS_POR_IMAGEN = 12
+# Columnas (mismo orden en las dos tablas para los indices 0..7):
+#   0 Tramite | 1 Fecha Fin | 2 Razon Social | 3 Nombre | 4 Marca
+#   5 Modelo/s | 6 PM | 7 Expediente | (8/9 links de documento, no se usan)
+COL = {
+    "tramite": 0,
+    "fecha": 1,
+    "razon": 2,
+    "nombre": 3,
+    "marca": 4,
+    "modelo": 5,
+    "pm": 6,
+    "expediente": 7,
+}
 
 
-def parse_boletin(html_text):
-    """Extrae la lista de registros de la tabla de tramites."""
+def _es_expediente(exp):
+    """True si 'exp' parece un expediente ANMAT real (ej. 1-0047-3110-004096-26-3).
+
+    Sirve para descartar las filas basura que la grilla ASP.NET agrega al final
+    (el paginador '1 2 3 ... >>' y una fila fantasma de conteo), que si no se
+    filtran entran como si fueran registros.
+    """
+    return exp.count("-") >= 3 and any(c.isdigit() for c in exp)
+
+
+def parse_tabla(html_text, table_id, solapa):
+    """Extrae los registros de una tabla (por id) y los etiqueta con la solapa."""
     soup = BeautifulSoup(html_text, "html.parser")
-    tabla = soup.find("table", id=TABLE_ID)
-    if tabla is None:
-        tabla = soup.find("table")  # fallback
+    tabla = soup.find("table", id=table_id)
     items = []
     if tabla is None:
         return items
     for tr in tabla.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 8:
-            continue  # saltea encabezado (th) y filas raras
+            continue  # encabezado (th) o filas sin datos
+
         def celda(i):
             return tds[i].get_text(" ", strip=True) if i < len(tds) else ""
-        items.append({
-            "tramite": celda(0),
-            "razon": celda(2),
-            "nombre": celda(3),
-            "marca": celda(4),
-            "modelo": celda(5),
-            "pm": celda(6),
-            "expediente": celda(7),
-        })
+
+        item = {"solapa": solapa}
+        for campo, idx in COL.items():
+            item[campo] = celda(idx)
+
+        if not _es_expediente(item["expediente"]):
+            continue  # descarta paginador / pie de la grilla
+        items.append(item)
     return items
 
 
-def fetch_boletin():
+def fetch_todo():
+    """Descarga la pagina y devuelve (registros, notificaciones)."""
     r = requests.get(
         URL,
         timeout=45,
         headers={"User-Agent": "alertas-anmat-bot/1.0 (+github actions)"},
     )
     r.raise_for_status()
-    return parse_boletin(r.content)
+    html = r.content
+    registros = parse_tabla(html, TABLA_REGISTROS, "Registros")
+    notificaciones = parse_tabla(html, TABLA_NOTIFICACIONES, "Notificaciones")
+    return registros, notificaciones
 
 
 def clave(item):
-    """Identificador unico e invisible para no repetir avisos."""
+    """Identificador unico e invisible para no repetir avisos.
+
+    - Registros: se mantiene la clave = expediente (compatibilidad con el estado
+      ya guardado en vistos_boletin.json; cambiarla reenviaria todo el historial).
+    - Notificaciones: clave compuesta con prefijo NOTIF|, porque en esta solapa
+      un mismo expediente puede repetirse para productos distintos (ej. 3083-10).
+    """
+    if item["solapa"] == "Notificaciones":
+        return "NOTIF|" + "|".join([
+            item["expediente"], item["nombre"], item["marca"], item["fecha"],
+        ])
     if item["expediente"]:
         return item["expediente"]
     return "|".join([item["tramite"], item["nombre"], item["pm"], item["marca"]])
+
+
+def dedup(items):
+    """Colapsa filas repetidas (misma clave) conservando el orden."""
+    vistos = set()
+    out = []
+    for it in items:
+        k = clave(it)
+        if k in vistos:
+            continue
+        vistos.add(k)
+        out.append(it)
+    return out
 
 
 def load_seen():
@@ -102,12 +162,83 @@ def save_seen(claves):
     )
 
 
-def resumir_modelo(txt, limite=MODELO_LIMITE):
-    txt = " ".join((txt or "").split())
-    if len(txt) <= limite:
-        return txt
-    return txt[:limite].rstrip() + "…"
+# ---------------------------------------------------------------------------
+# Excel
+# ---------------------------------------------------------------------------
 
+# Tipo va primero para distinguir de un vistazo Registro vs Notificación.
+# La columna "modelo" (Modelo/s) es la unica con ajuste de texto.
+_HEADERS = [
+    ("tipo", "Tipo", 14),
+    ("tramite", "Trámite", 34),
+    ("fecha", "Fecha", 12),
+    ("razon", "Razón Social", 36),
+    ("nombre", "Nombre", 34),
+    ("marca", "Marca", 24),
+    ("modelo", "Modelo/s", 60),
+    ("pm", "PM", 14),
+    ("expediente", "Expediente", 24),
+]
+
+# Etiqueta legible de la columna Tipo segun la solapa de origen.
+_TIPO = {"Registros": "Registro", "Notificaciones": "Notificación"}
+
+
+def _orden(it):
+    """Ordena por Razón Social (A→Z, sin distinguir may/min), luego Tipo y Nombre."""
+    return (
+        (it.get("razon", "") or "").strip().upper(),
+        it.get("tipo", ""),
+        (it.get("nombre", "") or "").strip().upper(),
+    )
+
+
+def construir_excel(nuevos_reg, nuevos_notif, path):
+    """Crea un .xlsx con UNA hoja que junta las dos solapas.
+
+    Columna "Tipo" (Registro / Notificación) para diferenciarlas y ordenado
+    por Razón Social, para ver juntas todas las filas de una misma empresa.
+    """
+    filas = []
+    for it in nuevos_reg:
+        filas.append({**it, "tipo": _TIPO["Registros"]})
+    for it in nuevos_notif:
+        filas.append({**it, "tipo": _TIPO["Notificaciones"]})
+    filas.sort(key=_orden)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Novedades"
+
+    header_fill = PatternFill("solid", fgColor="2E6DA4")
+    header_font = Font(bold=True, color="FFFFFF")
+    ws.append([h[1] for h in _HEADERS])
+    for ci, (_k, _t, ancho) in enumerate(_HEADERS, 1):
+        c = ws.cell(row=1, column=ci)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(vertical="center")
+        ws.column_dimensions[get_column_letter(ci)].width = ancho
+
+    for it in filas:
+        ws.append([it.get(k, "") for (k, _t, _w) in _HEADERS])
+
+    # Ajuste de texto en Modelo/s (por nombre de encabezado, robusto al orden).
+    col_modelo = [h[0] for h in _HEADERS].index("modelo") + 1
+    for row in ws.iter_rows(min_row=2, min_col=col_modelo, max_col=col_modelo):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    ws.freeze_panes = "A2"
+    ultima_col = get_column_letter(len(_HEADERS))
+    ws.auto_filter.ref = f"A1:{ultima_col}{max(ws.max_row, 1)}"
+    wb.save(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -120,71 +251,96 @@ def send_telegram(text):
     return resp.json()
 
 
-def send_photo(path, caption):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+def send_document(path, caption):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
     with open(path, "rb") as f:
         resp = requests.post(
             url,
-            data={"chat_id": CHAT_ID, "caption": caption},
-            files={"photo": f},
-            timeout=60,
+            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+            files={"document": (os.path.basename(path), f)},
+            timeout=120,
         )
     resp.raise_for_status()
     return resp.json()
 
 
-def enviar_digest(nuevos):
-    """Arma una o varias fotos tipo grilla con los registros nuevos."""
-    grupos = [nuevos[i:i + FILAS_POR_IMAGEN] for i in range(0, len(nuevos), FILAS_POR_IMAGEN)]
-    total = len(grupos)
-    for idx, grupo in enumerate(grupos, 1):
-        filas = [{
-            "nombre": r["nombre"],
-            "razon": r["razon"],
-            "marca": r["marca"],
-            "tramite": r["tramite"],
-            "pm": r["pm"],
-            "modelo": resumir_modelo(r["modelo"]),
-        } for r in grupo]
-        parte = f" — parte {idx} de {total}" if total > 1 else ""
-        titulo = f"Nuevos registros — Boletín ANMAT ({len(nuevos)} nuevos){parte}"
-        salida = f"tabla_boletin_{idx}.png"
-        tabla_img.render_tabla(filas, titulo, salida)
-        send_photo(salida, f"🆕 Nuevos registros de productos médicos (Boletín ANMAT){parte}")
+def enviar_excel(nuevos_reg, nuevos_notif):
+    """Arma el Excel con las novedades y lo manda como documento por Telegram."""
+    hoy = datetime.now(TZ).strftime("%Y-%m-%d") if TZ else datetime.now().strftime("%Y-%m-%d")
+    path = f"boletin_anmat_{hoy}.xlsx"
+    construir_excel(nuevos_reg, nuevos_notif, path)
+    total = len(nuevos_reg) + len(nuevos_notif)
+    caption = (
+        f"🆕 <b>Boletín ANMAT — {total} novedad(es)</b>\n"
+        f"• Registros: {len(nuevos_reg)}\n"
+        f"• Notificaciones: {len(nuevos_notif)}"
+    )
+    send_document(path, caption)
+
+
+# ---------------------------------------------------------------------------
+# Logica principal
+# ---------------------------------------------------------------------------
+
+def revisar():
+    """Revisa las dos solapas, avisa lo nuevo (Excel) y devuelve (n_reg, n_notif)."""
+    registros, notificaciones = fetch_todo()
+    print(
+        f"Boletin: {len(registros)} registros y {len(notificaciones)} "
+        f"notificaciones en la pagina."
+    )
+
+    seen = load_seen()
+
+    # Primera ejecucion absoluta (no existe el archivo de estado):
+    # sembramos todo y avisamos que quedo activo, sin volcar el backlog.
+    if seen is None:
+        claves = {clave(r) for r in registros} | {clave(n) for n in notificaciones}
+        save_seen(claves)
+        send_telegram(
+            "✅ <b>Aviso del Boletín ANMAT activado</b>\n\n"
+            "Reviso las solapas <b>Registros</b> y <b>Notificaciones</b> y te "
+            "aviso las novedades en un archivo Excel.\n"
+            f"Ahora hay {len(registros)} registros y {len(notificaciones)} "
+            "notificaciones recientes; de acá en más solo te aviso las nuevas."
+        )
+        print("Boletin: primera ejecucion, estado sembrado.")
+        return 0, 0
+
+    # ¿Ya venimos siguiendo Notificaciones? (la solapa se sumo despues).
+    hay_estado_notif = any(k.startswith("NOTIF|") for k in seen)
+
+    nuevos_reg = dedup([r for r in registros if clave(r) not in seen])
+
+    if hay_estado_notif:
+        nuevos_notif = dedup([n for n in notificaciones if clave(n) not in seen])
+    else:
+        # Primera vez con Notificaciones: sembrar sin avisar el backlog historico.
+        nuevos_notif = []
+        if notificaciones:
+            send_telegram(
+                "✅ <b>Notificaciones agregadas al aviso del Boletín ANMAT</b>\n\n"
+                "Desde ahora también te aviso las nuevas declaraciones juradas "
+                "PM I-II de la solapa <b>Notificaciones</b>, en el mismo Excel."
+            )
+
+    if nuevos_reg or nuevos_notif:
+        enviar_excel(nuevos_reg, nuevos_notif)
+
+    # Guardar estado con las claves actuales de las dos solapas (siembra
+    # Notificaciones en esta corrida y mantiene fresca la ventana de vistos).
+    seen |= {clave(r) for r in registros} | {clave(n) for n in notificaciones}
+    save_seen(seen)
+
+    print(f"Boletin: {len(nuevos_reg)} registros nuevos, {len(nuevos_notif)} notificaciones nuevas.")
+    return len(nuevos_reg), len(nuevos_notif)
 
 
 def main():
     if not TOKEN or not CHAT_ID:
         print("ERROR: faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID.")
         sys.exit(1)
-
-    registros = fetch_boletin()
-    print(f"Se encontraron {len(registros)} registros en la pagina del Boletin.")
-
-    seen = load_seen()
-    claves_actuales = {clave(r) for r in registros}
-
-    # Primera ejecucion: guardamos el estado y avisamos que quedo activo,
-    # sin mandar los registros que ya estan publicados.
-    if seen is None:
-        save_seen(claves_actuales)
-        msg = (
-            "✅ <b>Aviso de nuevos registros (Boletín ANMAT) activado</b>\n\n"
-            "Te voy a avisar con una foto tipo grilla cuando se registren nuevos "
-            "productos médicos.\n"
-            f"Ahora mismo hay {len(registros)} registros recientes en la lista; "
-            "a partir de acá solo te aviso los que sean nuevos."
-        )
-        send_telegram(msg)
-        print("Primera ejecucion: estado inicial guardado y aviso enviado.")
-        return
-
-    nuevos = [r for r in registros if clave(r) not in seen]
-    if nuevos:
-        enviar_digest(nuevos)
-        save_seen(seen | claves_actuales)
-
-    print(f"Se avisaron {len(nuevos)} registros nuevos.")
+    revisar()
 
 
 if __name__ == "__main__":
