@@ -4,7 +4,7 @@ Aviso diario unificado de ANMAT -> Telegram.
 
 Una vez por dia (18:00 hora Argentina) revisa las dos fuentes:
   - Alertas de ANMAT  (texto)
-  - Boletin de productos medicos  (foto tipo grilla)
+  - Boletin de productos medicos  (Excel: Registros + Notificaciones, columna Tipo, ordenado por Razon Social)
 
 Manda todo lo nuevo junto. Si no hay NADA nuevo en ninguna de las dos,
 manda un unico mensaje: "No hay avisos de ANMAT por hoy".
@@ -34,14 +34,9 @@ def revisar_alertas():
 
 
 def revisar_boletin():
-    """Envia los registros nuevos (foto grilla) y devuelve cuantos fueron."""
-    registros = boletin.fetch_boletin()
-    seen = boletin.load_seen() or set()
-    nuevos = [r for r in registros if boletin.clave(r) not in seen]
-    if nuevos:
-        boletin.enviar_digest(nuevos)
-        boletin.save_seen(seen | {boletin.clave(r) for r in registros})
-    return len(nuevos)
+    """Envia las novedades del Boletin (Excel) y devuelve cuantas fueron en total."""
+    n_reg, n_notif = boletin.revisar()
+    return n_reg + n_notif
 
 
 def main():
@@ -51,7 +46,7 @@ def main():
 
     n_alertas = revisar_alertas()
     n_boletin = revisar_boletin()
-    print(f"Alertas nuevas: {n_alertas} | Registros nuevos del Boletin: {n_boletin}")
+    print(f"Alertas nuevas: {n_alertas} | Novedades del Boletin: {n_boletin}")
 
     if n_alertas == 0 and n_boletin == 0:
         boletin.send_telegram("📭 <b>No hay avisos de ANMAT por hoy.</b>")
