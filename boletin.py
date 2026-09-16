@@ -183,6 +183,13 @@ _HEADERS = [
 # Etiqueta legible de la columna Tipo segun la solapa de origen.
 _TIPO = {"Registros": "Registro", "Notificaciones": "Notificación"}
 
+# La columna Modelo/s puede tener 30+ items y hacer filas gigantes. Limitamos
+# la ALTURA visible a ~4 lineas; el texto completo queda en la celda (se ve
+# expandiendo la fila) y el detalle fino esta siempre en el Boletin de ANMAT.
+LINEAS_MODELO = 4
+_ALTO_LINEA = 15          # alto aprox. de una linea (Calibri 11), en puntos
+_ALTO_FILA = LINEAS_MODELO * _ALTO_LINEA
+
 
 def _orden(it):
     """Ordena por Razón Social (A→Z, sin distinguir may/min), luego Tipo y Nombre."""
@@ -228,6 +235,11 @@ def construir_excel(nuevos_reg, nuevos_notif, path):
     for row in ws.iter_rows(min_row=2, min_col=col_modelo, max_col=col_modelo):
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # Altura fija de las filas de datos: muestra ~4 lineas de Modelo/s y oculta
+    # el resto (la fila se puede expandir a mano para ver todo el texto).
+    for r in range(2, ws.max_row + 1):
+        ws.row_dimensions[r].height = _ALTO_FILA
 
     ws.freeze_panes = "A2"
     ultima_col = get_column_letter(len(_HEADERS))
