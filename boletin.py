@@ -147,12 +147,24 @@ def dedup(items):
 
 
 def load_seen():
+    """Devuelve el set de claves ya avisadas, o None si es 'primera corrida'.
+
+    Un archivo inexistente, vacio (`[]`) o ilegible se trata como primera corrida:
+    en ese caso se muestran SOLO las novedades de hoy y se siembra el resto.
+    """
     if STATE_FILE.exists():
         try:
-            return set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return set(data) if data else None
         except Exception:
-            return set()
+            return None
     return None
+
+
+def _hoy():
+    """Fecha de hoy en formato del Boletin (DD-MM-YYYY), hora Argentina."""
+    ahora = datetime.now(TZ) if TZ else datetime.now()
+    return ahora.strftime("%d-%m-%Y")
 
 
 def save_seen(claves):
@@ -317,21 +329,26 @@ def revisar():
     )
 
     seen = load_seen()
+    hoy = _hoy()
 
-    # Primera ejecucion absoluta (no existe el archivo de estado):
-    # sembramos todo y avisamos que quedo activo, sin volcar el backlog.
+    # Primera corrida (sin estado / estado vacio): mostramos SOLO las novedades
+    # de HOY en las dos solapas y sembramos el resto (dias anteriores) en
+    # silencio, para no volcar el backlog historico.
     if seen is None:
-        claves = {clave(r) for r in registros} | {clave(n) for n in notificaciones}
-        save_seen(claves)
-        send_telegram(
-            "✅ <b>Aviso del Boletín ANMAT activado</b>\n\n"
-            "Reviso las solapas <b>Registros</b> y <b>Notificaciones</b> y te "
-            "aviso las novedades en un archivo Excel.\n"
-            f"Ahora hay {len(registros)} registros y {len(notificaciones)} "
-            "notificaciones recientes; de acá en más solo te aviso las nuevas."
-        )
-        print("Boletin: primera ejecucion, estado sembrado.")
-        return 0, 0
+        nuevos_reg = dedup([r for r in registros if r.get("fecha") == hoy])
+        nuevos_notif = dedup([n for n in notificaciones if n.get("fecha") == hoy])
+        if nuevos_reg or nuevos_notif:
+            enviar_excel(nuevos_reg, nuevos_notif)
+        else:
+            send_telegram(
+                "✅ <b>Aviso del Boletín ANMAT activado</b>\n\n"
+                "Reviso las solapas <b>Registros</b> y <b>Notificaciones</b> y te "
+                "aviso las novedades en un archivo Excel. Hoy todavía no hay "
+                "novedades nuevas."
+            )
+        save_seen({clave(r) for r in registros} | {clave(n) for n in notificaciones})
+        print(f"Boletin: primera corrida, {len(nuevos_reg)} registros y {len(nuevos_notif)} notificaciones de hoy.")
+        return len(nuevos_reg), len(nuevos_notif)
 
     # ¿Ya venimos siguiendo Notificaciones? (la solapa se sumo despues).
     hay_estado_notif = any(k.startswith("NOTIF|") for k in seen)
@@ -341,14 +358,9 @@ def revisar():
     if hay_estado_notif:
         nuevos_notif = dedup([n for n in notificaciones if clave(n) not in seen])
     else:
-        # Primera vez con Notificaciones: sembrar sin avisar el backlog historico.
-        nuevos_notif = []
-        if notificaciones:
-            send_telegram(
-                "✅ <b>Notificaciones agregadas al aviso del Boletín ANMAT</b>\n\n"
-                "Desde ahora también te aviso las nuevas declaraciones juradas "
-                "PM I-II de la solapa <b>Notificaciones</b>, en el mismo Excel."
-            )
+        # Primera vez con Notificaciones sobre un estado ya existente: mostramos
+        # las de HOY y sembramos las de dias anteriores en silencio.
+        nuevos_notif = dedup([n for n in notificaciones if n.get("fecha") == hoy])
 
     if nuevos_reg or nuevos_notif:
         enviar_excel(nuevos_reg, nuevos_notif)
