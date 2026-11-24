@@ -2,11 +2,21 @@ name: Avisos ANMAT (diario)
 
 on:
   schedule:
-    - cron: "0 21 * * *"   # 18:00 hora Argentina (UTC-3)
-  workflow_dispatch:          # boton para ejecutarlo a mano
+    - cron: "0 21 * * *"   # 18:00 hora Argentina (UTC-3) -> aviso diario
+    # Reintentos: solo hacen algo si una web de ANMAT quedo caida (fallos.json).
+    # Si no hay nada pendiente terminan sin mandar ningun mensaje.
+    - cron: "0 1 * * *"    # 22:00 ART
+    - cron: "0 12 * * *"   # 09:00 ART del dia siguiente
+    - cron: "0 15 * * *"   # 12:00 ART
+  workflow_dispatch:          # boton para ejecutarlo a mano (modo diario)
 
 permissions:
   contents: write
+
+# Nunca dos corridas a la vez (evita choques al guardar el estado).
+concurrency:
+  group: avisos-anmat
+  cancel-in-progress: false
 
 jobs:
   avisar:
@@ -27,16 +37,32 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODO: ${{ (github.event_name == 'schedule' && github.event.schedule != '0 21 * * *') && 'reintento' || 'diario' }}
         run: python avisos.py
 
       - name: Guardar el estado (lo ya avisado)
+        if: always()
         run: |
-          if [ -n "$(git status --porcelain vistos.json vistos_boletin.json)" ]; then
+          if [ -n "$(git status --porcelain vistos.json vistos_boletin.json fallos.json)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add vistos.json vistos_boletin.json
+            git add vistos.json vistos_boletin.json fallos.json
             git commit -m "Actualizar estado de avisos"
             git push
           else
             echo "Sin cambios en el estado"
           fi
+
+      # Red de seguridad: si algo se rompio de forma inesperada (no una caida de
+      # la web, que ya se avisa desde el script), avisar igual por Telegram.
+      - name: Avisar por Telegram si el workflow fallo
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=⚠️ El aviso de ANMAT tuvo un error inesperado hoy. Detalle: ${RUN_URL}" \
+            > /dev/null
