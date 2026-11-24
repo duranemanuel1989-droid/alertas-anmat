@@ -23,8 +23,12 @@ Usa los mismos Secrets que el bot de alertas:
 """
 
 import os
+import re
 import sys
 import json
+import time
+import unicodedata
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -102,17 +106,135 @@ def parse_tabla(html_text, table_id, solapa):
     return items
 
 
-def fetch_todo():
-    """Descarga la pagina y devuelve (registros, notificaciones)."""
-    r = requests.get(
-        URL,
-        timeout=45,
-        headers={"User-Agent": "alertas-anmat-bot/1.0 (+github actions)"},
-    )
+class BoletinCaido(Exception):
+    """La web de Helena no respondio o no trajo las tablas esperadas."""
+
+
+# Nombres ASP.NET de las grillas (para pedir la pagina 2, 3... por postback).
+_EVENT_TARGET = {
+    "Registros": "ctl00$ContentPlaceHolder1$gvTramites",
+    "Notificaciones": "ctl00$ContentPlaceHolder1$gvDeclaraciones",
+}
+_TABLA_ID = {"Registros": TABLA_REGISTROS, "Notificaciones": TABLA_NOTIFICACIONES}
+
+# Cuantas paginas (de ~50 filas) leer como maximo por solapa. Normalmente
+# alcanza con la 1; se leen mas solo si TODA la pagina es nueva (dias con
+# muchas novedades o recuperacion despues de un dia en que la web fallo).
+MAX_PAGINAS = 6
+
+# Reintentos ante errores de red / web caida, antes de darla por caida.
+REINTENTOS = 3
+ESPERA_REINTENTO = (20, 60)   # segundos entre intentos
+
+_UA = {"User-Agent": "alertas-anmat-bot/1.0 (+github actions)"}
+
+
+def _con_reintentos(fn, *args, **kwargs):
+    ultimo = None
+    for intento in range(1, REINTENTOS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # red, timeout, HTTP 5xx, pagina rota...
+            ultimo = e
+            print(f"Boletin: intento {intento}/{REINTENTOS} fallo: {e!r}")
+            if intento < REINTENTOS:
+                time.sleep(ESPERA_REINTENTO[min(intento - 1, len(ESPERA_REINTENTO) - 1)])
+    raise BoletinCaido(f"Helena no respondio tras {REINTENTOS} intentos: {ultimo!r}")
+
+
+def _campos_formulario(html):
+    """Campos del formulario ASP.NET (VIEWSTATE, filtros...) para hacer postback."""
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form")
+    if form is None:
+        raise BoletinCaido("la pagina no trae el formulario")
+    datos = {}
+    for el in form.find_all("input"):
+        nombre = el.get("name")
+        tipo = (el.get("type") or "text").lower()
+        if not nombre or tipo in ("submit", "button", "image", "file"):
+            continue
+        if tipo in ("checkbox", "radio") and not el.has_attr("checked"):
+            continue
+        datos[nombre] = el.get("value", "")
+    for sel in form.find_all("select"):
+        nombre = sel.get("name")
+        if not nombre:
+            continue
+        op = sel.find("option", selected=True) or sel.find("option")
+        datos[nombre] = op.get("value", "") if op else ""
+    return datos
+
+
+def _texto(r):
+    """HTML como texto, en UTF-8 si el servidor no declara la codificacion
+    (para no romper tildes como 'recolección')."""
+    if "charset" not in r.headers.get("Content-Type", "").lower():
+        r.encoding = "utf-8"
+    return r.text
+
+
+def _get_pagina1(sesion):
+    r = sesion.get(URL, timeout=60, headers=_UA)
     r.raise_for_status()
-    html = r.content
-    registros = parse_tabla(html, TABLA_REGISTROS, "Registros")
-    notificaciones = parse_tabla(html, TABLA_NOTIFICACIONES, "Notificaciones")
+    html = _texto(r)
+    if "gvTramites" not in html and "gvDeclaraciones" not in html:
+        raise RuntimeError("la pagina cargo pero sin las tablas del Boletin")
+    return html
+
+
+def _post_pagina(sesion, html_anterior, solapa, n):
+    datos = _campos_formulario(html_anterior)
+    datos["__EVENTTARGET"] = _EVENT_TARGET[solapa]
+    datos["__EVENTARGUMENT"] = f"Page${n}"
+    r = sesion.post(URL, data=datos, timeout=90, headers=_UA)
+    r.raise_for_status()
+    html = _texto(r)
+    if _TABLA_ID[solapa] not in html:
+        raise RuntimeError(f"pagina {n} de {solapa} sin tabla")
+    return html
+
+
+def _hay_pagina(html, solapa, n):
+    """True si el paginador de la grilla ofrece la pagina n."""
+    return f"'{_EVENT_TARGET[solapa]}','Page${n}'" in html or \
+        f"&#39;{_EVENT_TARGET[solapa]}&#39;,&#39;Page${n}&#39;" in html
+
+
+def _leer_solapa(sesion, html1, solapa, seen):
+    """Lee la solapa empezando por la pagina 1 y sigue mientras TODO sea nuevo."""
+    items = parse_tabla(html1, _TABLA_ID[solapa], solapa)
+    if seen is None:
+        return items                      # primera corrida: alcanza con la pag. 1
+    if solapa == "Notificaciones" and not any(k.startswith("NOTIF|") for k in seen):
+        return items                      # todavia sin estado de Notificaciones
+    html, pagina, ultimos = html1, 1, items
+    # La grilla viene de la mas nueva a la mas vieja: si las ULTIMAS filas de la
+    # pagina (las mas viejas) todavia son nuevas, puede haber mas en la siguiente.
+    # (Se miran las ultimas 5 y no solo 1, por si alguna fila suelta repite un
+    # expediente ya avisado, ej. una revalida.)
+    while (ultimos and any(clave(it) not in seen for it in ultimos[-5:])
+           and pagina < MAX_PAGINAS and _hay_pagina(html, solapa, pagina + 1)):
+        pagina += 1
+        print(f"Boletin: el final de la pagina {pagina - 1} de {solapa} es nuevo -> leo la pagina {pagina}.")
+        html = _con_reintentos(_post_pagina, sesion, html, solapa, pagina)
+        ultimos = parse_tabla(html, _TABLA_ID[solapa], solapa)
+        items.extend(ultimos)
+    return items
+
+
+def fetch_todo(seen=None):
+    """Descarga el Boletin y devuelve (registros, notificaciones).
+
+    Reintenta si la web no responde; si sigue caida lanza BoletinCaido.
+    Lee paginas extra cuando hay mas novedades que las ~50 filas de la pagina 1.
+    """
+    sesion = requests.Session()
+    html1 = _con_reintentos(_get_pagina1, sesion)
+    registros = _leer_solapa(sesion, html1, "Registros", seen)
+    notificaciones = _leer_solapa(sesion, html1, "Notificaciones", seen)
+    if not registros and not notificaciones:
+        raise BoletinCaido("la pagina cargo pero las dos tablas vinieron vacias")
     return registros, notificaciones
 
 
@@ -216,6 +338,28 @@ def _recortar_modelo(txt, limite=MODELO_MAX_CHARS):
     return corte.rstrip(" ,;.") + " […]"
 
 
+# Filas a RESALTAR en el Excel: todo lo que sea "tubos de recolección".
+# Se compara sin tildes ni mayusculas y acepta "tubo(s) de/para recolección"
+# (ANMAT lo escribe de las dos formas, ej. "Tubos para recolección de sangre")
+# y la version en ingles "blood collection tube(s)".
+PATRON_RESALTAR = re.compile(
+    r"\btubos?\s+(?:de|para)\s+(?:la\s+)?recoleccion|\bblood\s+collection\s+tubes?\b"
+)
+CAMPOS_RESALTAR = ("nombre", "marca", "modelo", "tramite")
+RESALTAR_FILL = PatternFill("solid", fgColor="FFD966")   # amarillo/ambar fuerte
+RESALTAR_FONT = Font(bold=True, color="7F2704")          # bordo, negrita
+
+
+def _normalizar(txt):
+    txt = unicodedata.normalize("NFKD", txt or "")
+    return "".join(c for c in txt if not unicodedata.combining(c)).lower()
+
+
+def es_tubo_recoleccion(it):
+    """True si la fila habla de tubos de recoleccion (en cualquiera de sus campos)."""
+    return any(PATRON_RESALTAR.search(_normalizar(it.get(c, ""))) for c in CAMPOS_RESALTAR)
+
+
 def _orden(it):
     """Ordena por Razón Social (A→Z, sin distinguir may/min), luego Tipo y Nombre."""
     return (
@@ -252,6 +396,7 @@ def construir_excel(nuevos_reg, nuevos_notif, path):
         c.alignment = Alignment(vertical="center")
         ws.column_dimensions[get_column_letter(ci)].width = ancho
 
+    col_modelo = [h[0] for h in _HEADERS].index("modelo") + 1
     for it in filas:
         fila = []
         for (k, _t, _w) in _HEADERS:
@@ -260,12 +405,16 @@ def construir_excel(nuevos_reg, nuevos_notif, path):
                 v = _recortar_modelo(v)   # ~4 lineas, con " […]" si se corta
             fila.append(v)
         ws.append(fila)
-
-    # Ajuste de texto en Modelo/s (por nombre de encabezado, robusto al orden).
-    col_modelo = [h[0] for h in _HEADERS].index("modelo") + 1
-    for row in ws.iter_rows(min_row=2, min_col=col_modelo, max_col=col_modelo):
-        for cell in row:
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        r = ws.max_row
+        # Ajuste de texto en Modelo/s (por nombre de encabezado, robusto al orden).
+        ws.cell(row=r, column=col_modelo).alignment = Alignment(wrap_text=True, vertical="top")
+        # Resaltar toda la fila si es "tubos de recolección" (se evalua sobre el
+        # texto completo, antes del recorte de Modelo/s).
+        if es_tubo_recoleccion(it):
+            for ci in range(1, len(_HEADERS) + 1):
+                c = ws.cell(row=r, column=ci)
+                c.fill = RESALTAR_FILL
+                c.font = RESALTAR_FONT
 
     ws.freeze_panes = "A2"
     ultima_col = get_column_letter(len(_HEADERS))
@@ -302,34 +451,63 @@ def send_document(path, caption):
     return resp.json()
 
 
-def enviar_excel(nuevos_reg, nuevos_notif):
-    """Arma el Excel con las novedades y lo manda como documento por Telegram."""
+def _fmt_fecha(f):
+    """'18-11-2026' o '2026-11-18' -> '18/11'."""
+    p = f.split("-")
+    if len(p) == 3:
+        return f"{p[2]}/{p[1]}" if len(p[0]) == 4 else f"{p[0]}/{p[1]}"
+    return f
+
+
+def enviar_excel(nuevos_reg, nuevos_notif, recuperado=None):
+    """Arma el Excel con las novedades y lo manda como documento por Telegram.
+
+    recuperado: lista de fechas (YYYY-MM-DD) en que la web fallo y cuyas
+    novedades vienen incluidas en este envio.
+    """
     hoy = datetime.now(TZ).strftime("%Y-%m-%d") if TZ else datetime.now().strftime("%Y-%m-%d")
     path = f"boletin_anmat_{hoy}.xlsx"
     construir_excel(nuevos_reg, nuevos_notif, path)
     total = len(nuevos_reg) + len(nuevos_notif)
-    caption = (
-        f"🆕 <b>Boletín ANMAT — {total} novedad(es)</b>\n"
-        f"• Registros: {len(nuevos_reg)}\n"
-        f"• Notificaciones: {len(nuevos_notif)}"
-    )
-    send_document(path, caption)
+    lineas = []
+    if recuperado:
+        dias = ", ".join(_fmt_fecha(d) for d in recuperado)
+        lineas.append(f"🔄 <b>Volvió la web de Helena.</b> Incluye lo pendiente del {dias}.\n")
+    lineas += [
+        f"🆕 <b>Boletín ANMAT — {total} novedad(es)</b>",
+        f"• Registros: {len(nuevos_reg)}",
+        f"• Notificaciones: {len(nuevos_notif)}",
+    ]
+    por_fecha = Counter(it.get("fecha", "") for it in nuevos_reg + nuevos_notif)
+    if len(por_fecha) > 1:
+        def _k(f):
+            p = f.split("-")
+            return tuple(reversed(p)) if len(p) == 3 else (f,)
+        detalle = " | ".join(f"{_fmt_fecha(f)}: {n}" for f, n in sorted(por_fecha.items(), key=lambda x: _k(x[0])))
+        lineas.append(f"📅 Por fecha: {detalle}")
+    n_tubos = sum(1 for it in nuevos_reg + nuevos_notif if es_tubo_recoleccion(it))
+    if n_tubos:
+        lineas.append(f"\n🩸 <b>Tubos de recolección: {n_tubos}</b> (resaltados en amarillo)")
+    send_document(path, "\n".join(lineas))
 
 
 # ---------------------------------------------------------------------------
 # Logica principal
 # ---------------------------------------------------------------------------
 
-def revisar():
-    """Revisa las dos solapas, avisa lo nuevo (Excel) y devuelve (n_reg, n_notif)."""
-    registros, notificaciones = fetch_todo()
-    print(
-        f"Boletin: {len(registros)} registros y {len(notificaciones)} "
-        f"notificaciones en la pagina."
-    )
+def revisar(recuperado=None):
+    """Revisa las dos solapas, avisa lo nuevo (Excel) y devuelve (n_reg, n_notif).
 
+    Si la web esta caida lanza BoletinCaido (sin enviar ni guardar nada), para
+    que el orquestador avise y lo reintente despues.
+    """
     seen = load_seen()
     hoy = _hoy()
+    registros, notificaciones = fetch_todo(seen)
+    print(
+        f"Boletin: {len(registros)} registros y {len(notificaciones)} "
+        f"notificaciones leidos."
+    )
 
     # Primera corrida (sin estado / estado vacio): mostramos SOLO las novedades
     # de HOY en las dos solapas y sembramos el resto (dias anteriores) en
@@ -363,7 +541,7 @@ def revisar():
         nuevos_notif = dedup([n for n in notificaciones if n.get("fecha") == hoy])
 
     if nuevos_reg or nuevos_notif:
-        enviar_excel(nuevos_reg, nuevos_notif)
+        enviar_excel(nuevos_reg, nuevos_notif, recuperado)
 
     # Guardar estado con las claves actuales de las dos solapas (siembra
     # Notificaciones en esta corrida y mantiene fresca la ventana de vistos).
